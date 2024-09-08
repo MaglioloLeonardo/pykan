@@ -5,9 +5,9 @@ with open("README.md", "r", encoding="utf8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="pykan",
+    name="pykanmagliolo",
     version="0.2.6",
-    author="Ziming Liu",
+    author="Ziming Liu (modified by Leonardo Magliolo)",
     author_email="zmliu@mit.edu",
     description="Kolmogorov Arnold Networks",
     long_description=long_description,
@@ -15,7 +15,7 @@ setuptools.setup(
     # url="https://github.com/kindxiaoming/",
     packages=setuptools.find_packages(),
     include_package_data=True,
-    package_data={  
+    package_data={
         'pykan': [
             'figures/lock.png',
             'assets/img/sum_symbol.png',
