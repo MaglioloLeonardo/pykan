@@ -1390,13 +1390,19 @@ class MultKAN(nn.Module):
         '''
         return self.parameters()
 
-    # Your existing KAN model `fit` method
+    import torch
+    from torch.optim import LBFGS
+    from tqdm import tqdm
+    from sklearn.metrics import confusion_matrix
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
     def fit(self, dataset, opt="LBFGS", steps=100, log=1, lamb=0., lamb_l1=1., lamb_entropy=2., lamb_coef=0.,
             lamb_coefdiff=0., update_grid=True, grid_update_num=10, loss_fn=None, lr=1., start_grid_update_step=-1,
             stop_grid_update_step=50, batch=-1, metrics=None, save_fig=False, in_vars=None, out_vars=None, beta=3,
             save_fig_freq=1, img_folder='./video', singularity_avoiding=False, y_th=1000.,
-            reg_metric='edge_forward_spline_n',
-            display_metrics=None):
+            reg_metric='edge_forward_spline_n', display_metrics=None, optimizer=None, scheduler=None):
         '''
         Modified training method that accumulates forward outputs and computes confusion matrices for both training and testing datasets.
 
@@ -1417,14 +1423,27 @@ class MultKAN(nn.Module):
 
         grid_update_freq = int(stop_grid_update_step / grid_update_num)
 
-        # Initialize optimizer
-        if opt == "Adam":
-            optimizer = torch.optim.Adam(self.get_params(), lr=lr)
-        elif opt == "LBFGS":
-            optimizer = LBFGS(self.get_params(), lr=lr, history_size=10, line_search_fn="strong_wolfe",
-                              tolerance_grad=1e-32, tolerance_change=1e-32, tolerance_ys=1e-32)
-        elif opt == "SGD":
-            optimizer = torch.optim.SGD(self.get_params(), lr=lr)
+        # Initialize optimizer if not provided
+        if optimizer is None:
+            if opt == "Adam":
+                optimizer = torch.optim.Adam(self.get_params(), lr=lr)
+            elif opt == "LBFGS":
+                optimizer = LBFGS(self.get_params(), lr=lr, history_size=10, line_search_fn="strong_wolfe",
+                                  tolerance_grad=1e-32, tolerance_change=1e-32, tolerance_ys=1e-32)
+            elif opt == "SGD":
+                optimizer = torch.optim.SGD(self.get_params(), lr=lr)
+            else:
+                raise ValueError(f"Invalid optimizer option '{opt}'. Valid options are 'Adam', 'LBFGS', or 'SGD'.")
+        else:
+            # Check if the provided optimizer is compatible
+            if not isinstance(optimizer, torch.optim.Optimizer):
+                raise ValueError("The provided optimizer is not a valid PyTorch optimizer.")
+
+        # Generalize scheduler validation by checking for the 'step' method
+        if scheduler is not None:
+            if not hasattr(scheduler, 'step') or not callable(getattr(scheduler, 'step')):
+                raise ValueError(
+                    "The provided scheduler does not have a 'step' method and is not a valid learning rate scheduler.")
 
         results = {'train_loss': [], 'test_loss': [], 'reg': []}
         if metrics is not None:
@@ -1485,6 +1504,8 @@ class MultKAN(nn.Module):
             # Optimization step
             if opt == "LBFGS":
                 optimizer.step(closure)
+                pred = self.forward(dataset['train_input'][train_id], singularity_avoiding=singularity_avoiding,
+                                    y_th=y_th)
             else:  # For "Adam" and "SGD"
                 pred = self.forward(dataset['train_input'][train_id], singularity_avoiding=singularity_avoiding,
                                     y_th=y_th)
@@ -1500,7 +1521,14 @@ class MultKAN(nn.Module):
                 loss = train_loss + lamb * reg_
                 optimizer.zero_grad()
                 loss.backward()
-                optimizer.step()
+                optimizer.step()  # Ensure optimizer step happens first
+
+            # Step the scheduler after optimizer.step()
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(train_loss.cpu().detach().numpy())  # Use train_loss or test_loss as needed
+                else:
+                    scheduler.step()  # Regular schedulers
 
             # Compute predictions for test data
             test_pred = self.forward(dataset['test_input'][test_id], singularity_avoiding=singularity_avoiding,
@@ -1508,9 +1536,10 @@ class MultKAN(nn.Module):
             test_loss = loss_fn_eval(test_pred, dataset['test_label'][test_id])
 
             # Accumulate predictions and true labels for train and test sets
-            # Ensure correct dimensions for concatenation
-            all_train_preds.append(pred.argmax(dim=1))
-            all_train_labels.append(dataset['train_label'][train_id])
+            if pred is not None:
+                all_train_preds.append(pred.argmax(dim=1))
+                all_train_labels.append(dataset['train_label'][train_id])
+
             all_test_preds.append(test_pred.argmax(dim=1))
             all_test_labels.append(dataset['test_label'][test_id])
 
@@ -1542,27 +1571,33 @@ class MultKAN(nn.Module):
 
             if save_fig and _ % save_fig_freq == 0:
                 self.plot(folder=img_folder, in_vars=in_vars, out_vars=out_vars, title="Step {}".format(_), beta=beta)
-                plt.savefig(img_folder + '/' + str(_) + '.jpg', bbox_inches='tight', dpi=200)
+                plt.savefig(os.path.join(img_folder, f'{_}.jpg'), bbox_inches='tight', dpi=200)
                 plt.close()
 
         self.log_history('fit')
         # Revert back to original state
         self.symbolic_enabled = old_symbolic_enabled
+        
+        # Concatenate all accumulated predictions and labels as tensors
+        if len(all_train_preds) > 0:  # Check if the list is not empty
+            all_train_preds = torch.cat(all_train_preds)  # Concatenate list to tensor
+            all_train_labels = torch.cat(all_train_labels)  # Concatenate list to tensor
 
-        # Concatenate all accumulated predictions and labels
-        all_train_preds = torch.cat(all_train_preds)
-        all_train_labels = torch.cat(all_train_labels)
-        all_test_preds = torch.cat(all_test_preds)
-        all_test_labels = torch.cat(all_test_labels)
+        if len(all_test_preds) > 0:
+            all_test_preds = torch.cat(all_test_preds)  # Concatenate list to tensor
+            all_test_labels = torch.cat(all_test_labels)  # Concatenate list to tensor
 
         # Compute confusion matrices for train and test sets
-        train_cm = confusion_matrix(all_train_labels.cpu().numpy(), all_train_preds.cpu().numpy())
-        test_cm = confusion_matrix(all_test_labels.cpu().numpy(), all_test_preds.cpu().numpy())
+        if len(all_train_preds) > 0:  # check if the list is not empty
+            train_cm = confusion_matrix(all_train_labels.cpu().numpy(), all_train_preds.cpu().numpy())
+            results['train_confusion_matrix'] = train_cm
 
-        # Add confusion matrices to results
-        results['train_confusion_matrix'] = train_cm
-        results['test_confusion_matrix'] = test_cm
-        
+        # Compute test confusion matrix
+        if len(all_test_preds) > 0:
+            test_cm = confusion_matrix(all_test_labels.cpu().numpy(), all_test_preds.cpu().numpy())
+            results['test_confusion_matrix'] = test_cm
+
+        # Return the results dictionary containing losses, metrics, and confusion matrices
         return results
 
     def prune_node(self, threshold=1e-2, mode="auto", active_neurons_id=None, log_history=True):
